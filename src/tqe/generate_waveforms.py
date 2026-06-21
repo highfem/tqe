@@ -1,0 +1,443 @@
+"""CLI for generating synthetic seismic waveforms from a pretrained latent DDM."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pickle
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, NamedTuple
+
+import h5py
+import jax
+import numpy as np
+import orbax.checkpoint
+import pooch
+from absl import logging
+from einops import rearrange
+from flax import jax_utils
+from flax.training import common_utils
+from jax import numpy as jnp
+from jax import random as jr
+from ml_collections import ConfigDict
+
+from tqe.denoising_diffusion import EDMParameterization, denoising_diffusion
+from tqe.nn import dit, vae
+from tqe.signal import processing_fns
+
+_DESCRIPTION = """\
+Generate synthetic seismic waveforms from a pretrained latent DDM.
+
+The first run downloads pretrained weights from Zenodo to
+~/.cache/tqe/weights/.  Override the cache location with $TQE_CACHE_DIR.
+
+Input HDF5 datasets:
+  context             float32 (N, L, 3)  three-component context waveforms
+                      (N, 3, L) channel-first is accepted and transposed)
+  magnitude, vs30, station_longitude, station_latitude,
+  station_elevation, hypocentre_depth, hypocentre_longitude,
+  hypocentre_latitude
+                      float32 (N,)       per-sample scalar metadata
+
+Output HDF5 datasets:
+  target_hat          float32 (N × n_per_entry, max_len, 3)
+  context             float32 (N × n_per_entry, max_len, 3)
+  meta                float32 (N × n_per_entry, 8)
+"""
+
+# ---------------------------------------------------------------------------
+# Zenodo weight registry
+# ---------------------------------------------------------------------------
+
+_ZENODO_BASE = "https://zenodo.org/record/PLACEHOLDER/files"
+_WEIGHTS: dict[str, str] = {
+  "context_encoder.tar.gz": "sha256:PLACEHOLDER",
+  "target_encoder.tar.gz": "sha256:PLACEHOLDER",
+  "latent_diffusion.tar.gz": "sha256:PLACEHOLDER",
+}
+_CACHE_DIR = (
+  Path(os.environ.get("TQE_CACHE_DIR", str(Path.home() / ".cache" / "tqe")))
+  / "weights"
+)
+
+
+def get_weights(cache_dir: Path | None = None) -> Path:
+  """Download and extract pretrained weights to the local cache directory.
+
+  Weights are cached; subsequent calls skip the download if checksums match.
+
+  Args:
+    cache_dir: Override for the default cache location (``$TQE_CACHE_DIR``
+      or ``~/.cache/tqe/weights``).
+
+  Returns:
+    Path to the directory containing the extracted checkpoint subdirectories.
+  """
+  dest = cache_dir or _CACHE_DIR
+  dest.mkdir(parents=True, exist_ok=True)
+  for name, checksum in _WEIGHTS.items():
+    pooch.retrieve(
+      url=f"{_ZENODO_BASE}/{name}",
+      known_hash=checksum,
+      fname=name,
+      path=str(dest),
+      processor=pooch.Untar(extract_dir=str(dest)),
+      progressbar=True,
+    )
+  return dest
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint loading
+# ---------------------------------------------------------------------------
+
+
+def _load_pickle(path: Path) -> dict:
+  with open(path, "rb") as f:
+    return pickle.load(f)  # noqa: S301
+
+
+def _restore_best(checkpoint_dir: Path) -> dict:
+  return orbax.checkpoint.PyTreeCheckpointer().restore(
+    str(checkpoint_dir / "best")
+  )
+
+
+def load_vae(checkpoint_dir: Path) -> tuple:
+  """Load a VAE model and its params from a checkpoint directory.
+
+  Args:
+    checkpoint_dir: Directory containing ``config.pkl`` and ``best/``.
+
+  Returns:
+    ``(model, params)`` ready for inference.
+  """
+  cfg = ConfigDict(_load_pickle(checkpoint_dir / "config.pkl"))
+  model = vae.make_model(cfg.nn)
+  params = _restore_best(checkpoint_dir)["state"]["params"]
+  return model, params
+
+
+def load_ddm(checkpoint_dir: Path) -> tuple:
+  """Load a DiT score model with EMA weights and its full generation config.
+
+  Args:
+    checkpoint_dir: Directory containing ``config.pkl``, ``full_config.pkl``,
+      and ``best/``.
+
+  Returns:
+    ``(model, full_cfg, ema_params)`` where ``full_cfg`` is a ``ConfigDict``
+    containing the full training configuration.
+
+  Raises:
+    FileNotFoundError: If ``full_config.pkl`` is absent.
+  """
+  full_cfg_path = checkpoint_dir / "full_config.pkl"
+  if not full_cfg_path.exists():
+    raise FileNotFoundError(
+      f"full_config.pkl not found in {checkpoint_dir}. "
+      "The latent_diffusion archive must include a full_config.pkl "
+      "with keys 'representation', 'training.ema_rate', and "
+      "'model.sampler.n_steps'."
+    )
+  cfg = ConfigDict(_load_pickle(checkpoint_dir / "config.pkl"))
+  full_cfg = ConfigDict(_load_pickle(full_cfg_path))
+  model = dit.make_model(cfg.nn.dit_score_net)
+  ema_params = _restore_best(checkpoint_dir)["state"]["ema_params"]
+  return model, full_cfg, ema_params
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+
+class _InferenceState(NamedTuple):
+  ema_params: Any
+
+
+class GenerationPipeline(NamedTuple):
+  """Loaded models and transforms ready for inference.
+
+  Attributes:
+    p_sample_fn: pmapped ``(rng_keys, pstate, batch) -> target_specs``.
+    pstate: EMA params replicated across devices.
+    repr_fn: Waveform-to-spectrogram transform.
+    inv_repr_fn: Spectrogram-to-waveform inverse transform.
+    max_len: Maximum waveform length in samples.
+    condition_keys: Ordered metadata field names expected in the input HDF5.
+  """
+
+  p_sample_fn: Callable
+  pstate: _InferenceState
+  repr_fn: Callable
+  inv_repr_fn: Callable
+  max_len: int
+  condition_keys: tuple[str, ...]
+
+
+def build_pipeline(weights_dir: Path) -> GenerationPipeline:
+  """Load pretrained models and assemble the generation pipeline.
+
+  Args:
+    weights_dir: Directory containing ``context_encoder/``, ``target_encoder/``,
+      and ``latent_diffusion/`` checkpoint subdirectories.
+
+  Returns:
+    A :class:`GenerationPipeline` ready to pass to :func:`generate`.
+  """
+  logging.info("loading context encoder")
+  ctx_model, ctx_params = load_vae(weights_dir / "context_encoder")
+  logging.info("loading target encoder")
+  tgt_model, tgt_params = load_vae(weights_dir / "target_encoder")
+  logging.info("loading latent diffusion model")
+  ddm_model, full_cfg, ddm_ema_params = load_ddm(
+    weights_dir / "latent_diffusion"
+  )
+
+  @jax.jit
+  def context_enc_fn(rngs, inputs):
+    z, _ = ctx_model.apply(
+      {"params": ctx_params},
+      rngs=rngs,
+      inputs=inputs,
+      is_training=False,
+      method=ctx_model.encode,
+    )
+    return z
+
+  @jax.jit
+  def target_dec_fn(_, inputs):
+    return tgt_model.apply(
+      {"params": tgt_params},
+      inputs=inputs,
+      is_training=False,
+      method=tgt_model.decode,
+    )
+
+  repr_cfg = full_cfg.representation
+  repr_fn, inv_repr_fn = processing_fns(
+    variable_names="context",
+    repres=repr_cfg,
+    max_len=repr_cfg.max_len,
+  )
+
+  edm_cfg = EDMParameterization(n_sampling_steps=full_cfg.model.sampler.n_steps)
+  ddm_sample_fn = denoising_diffusion(
+    ddm_model.apply, edm_cfg, full_cfg.training.ema_rate
+  ).sample_fn
+
+  def _sample(rng_key, state, batch):
+    ctx_key, sample_key = jr.split(rng_key)
+    z_context = context_enc_fn({"sample": ctx_key}, batch["context"])
+    z_target = ddm_sample_fn(
+      sample_key, state=state, context=z_context, condition=batch["condition"]
+    )
+    return target_dec_fn(None, z_target)
+
+  return GenerationPipeline(
+    p_sample_fn=jax.pmap(_sample, axis_name="batch"),
+    pstate=jax_utils.replicate(_InferenceState(ema_params=ddm_ema_params)),
+    repr_fn=repr_fn,
+    inv_repr_fn=inv_repr_fn,
+    max_len=repr_cfg.max_len,
+    condition_keys=tuple(full_cfg.data.condition_keys),
+  )
+
+
+# ---------------------------------------------------------------------------
+# I/O helpers
+# ---------------------------------------------------------------------------
+
+
+def _read_input_batches(
+  path: str, entry_batch_size: int, condition_keys: tuple
+):
+  """Yield (start, total, context, meta) chunks from an input HDF5 file.
+
+  Args:
+    path: Input HDF5 file path.
+    entry_batch_size: Number of input entries per chunk.
+    condition_keys: Ordered metadata field names to read from the file.
+
+  Yields:
+    ``(start_idx, total_entries, context, meta)`` where ``context`` is
+    float32 ``(B, L, 3)`` and ``meta`` is float32 ``(B, len(condition_keys))``.
+  """
+  with h5py.File(path, "r") as f:
+    total = len(f["context"])
+    for start in range(0, total, entry_batch_size):
+      sl = slice(start, start + entry_batch_size)
+      ctx = np.array(f["context"][sl], dtype=np.float32)
+      if ctx.ndim == 3 and ctx.shape[-1] != 3:
+        ctx = rearrange(ctx, "b c l -> b l c")
+      meta = np.stack(
+        [np.array(f[k][sl], dtype=np.float32) for k in condition_keys], axis=1
+      )
+      yield start, total, ctx, meta
+
+
+# ---------------------------------------------------------------------------
+# Generation loop
+# ---------------------------------------------------------------------------
+
+
+def generate(
+  pipeline: GenerationPipeline,
+  input_path: str,
+  output_path: str,
+  n_per_entry: int = 1,
+  batch_size_per_device: int = 64,
+  seed: int = 0,
+) -> None:
+  """Generate synthetic target waveforms and write them to an HDF5 file.
+
+  Args:
+    pipeline: Loaded pipeline from :func:`build_pipeline`.
+    input_path: Path to the input HDF5 file.
+    output_path: Path for the output HDF5 file (overwritten if it exists).
+    n_per_entry: Number of independent samples per input entry.
+    batch_size_per_device: Per-device batch size for pmap.
+    seed: RNG seed for reproducibility.
+  """
+  rng = jr.PRNGKey(seed)
+  n_dev = jax.device_count()
+  entry_chunk = max(1, batch_size_per_device * n_dev // n_per_entry)
+
+  with h5py.File(input_path, "r") as f_in:
+    total_entries = len(f_in["context"])
+  total_samples = total_entries * n_per_entry
+
+  logging.info(
+    "generating %d waveforms (%d entries × %d per entry) on %d device(s)",
+    total_samples,
+    total_entries,
+    n_per_entry,
+    n_dev,
+  )
+
+  with h5py.File(output_path, "w") as f_out:
+    ds_hat = f_out.create_dataset(
+      "target_hat", (total_samples, pipeline.max_len, 3), dtype="f4"
+    )
+    ds_ctx = f_out.create_dataset(
+      "context", (total_samples, pipeline.max_len, 3), dtype="f4"
+    )
+    ds_meta = f_out.create_dataset(
+      "meta", (total_samples, len(pipeline.condition_keys)), dtype="f4"
+    )
+
+    cursor = 0
+    for start, total, ctx_raw, meta in _read_input_batches(
+      input_path, entry_chunk, pipeline.condition_keys
+    ):
+      logging.info("  processing entries %d/%d", start, total)
+
+      ctx_spec = np.array(
+        pipeline.repr_fn({"context": ctx_raw, "meta": meta})["inputs"]
+      )
+      ctx_spec_rep = np.repeat(ctx_spec, n_per_entry, axis=0)
+      meta_rep = np.repeat(meta, n_per_entry, axis=0)
+      ctx_raw_rep = np.repeat(
+        ctx_raw[:, : pipeline.max_len, :], n_per_entry, axis=0
+      )
+
+      n_batch = ctx_spec_rep.shape[0]
+      pad = (-n_batch) % n_dev
+      if pad:
+        ctx_spec_pad = np.concatenate([ctx_spec_rep, ctx_spec_rep[:pad]])
+        meta_pad = np.concatenate([meta_rep, meta_rep[:pad]])
+      else:
+        ctx_spec_pad, meta_pad = ctx_spec_rep, meta_rep
+
+      pbatch = common_utils.shard(
+        {"context": jnp.array(ctx_spec_pad), "condition": jnp.array(meta_pad)}
+      )
+      rng, sample_rng = jr.split(rng)
+      specs_hat = pipeline.p_sample_fn(
+        jr.split(sample_rng, n_dev), pipeline.pstate, pbatch
+      )
+      specs_hat = np.array(specs_hat.reshape(-1, *specs_hat.shape[2:]))[
+        :n_batch
+      ]
+
+      signals_hat = np.array(pipeline.inv_repr_fn(jnp.array(specs_hat)))
+      min_len = min(
+        signals_hat.shape[1], pipeline.max_len, ctx_raw_rep.shape[1]
+      )
+
+      end = cursor + n_batch
+      ds_hat[cursor:end, :min_len] = signals_hat[:, :min_len]
+      ds_ctx[cursor:end, :min_len] = ctx_raw_rep[:, :min_len]
+      ds_meta[cursor:end] = meta_rep
+      cursor = end
+
+  logging.info("wrote %d samples to %r", cursor, output_path)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+  """Command-line entry point for ``tqe-generate``."""
+  parser = argparse.ArgumentParser(
+    prog="tqe-generate",
+    description=_DESCRIPTION,
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+  )
+  parser.add_argument(
+    "--input",
+    required=True,
+    help="Input HDF5 file with context waveforms and metadata.",
+  )
+  parser.add_argument(
+    "--output",
+    required=True,
+    help="Output HDF5 file for generated waveforms.",
+  )
+  parser.add_argument(
+    "--n-per-entry",
+    type=int,
+    default=1,
+    dest="n_per_entry",
+    help="Waveforms to generate per input entry (default: 1).",
+  )
+  parser.add_argument(
+    "--batch-size-per-device",
+    type=int,
+    default=64,
+    dest="batch_size_per_device",
+    help="Per-device batch size (default: 64).",
+  )
+  parser.add_argument(
+    "--seed",
+    type=int,
+    default=0,
+    help="RNG seed (default: 0).",
+  )
+  parser.add_argument(
+    "--weights-dir",
+    default=None,
+    dest="weights_dir",
+    help="Override the weights cache directory (skips auto-download).",
+  )
+  args = parser.parse_args()
+  logging.set_verbosity(logging.INFO)
+
+  weights_dir = Path(args.weights_dir) if args.weights_dir else get_weights()
+  pipeline = build_pipeline(weights_dir)
+  generate(
+    pipeline=pipeline,
+    input_path=args.input,
+    output_path=args.output,
+    n_per_entry=args.n_per_entry,
+    batch_size_per_device=args.batch_size_per_device,
+    seed=args.seed,
+  )
+
+
+if __name__ == "__main__":
+  main()

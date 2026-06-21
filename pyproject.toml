@@ -1,0 +1,106 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name =  "tqe"
+authors = [{name = "Simon Dirmeier", email = "simon.dirmeier@sdsc.ethz.ch"}]
+readme = "README.md"
+license = {file = "LICENSE"}
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "einops==0.8.0",
+    "flax==0.10.2",
+    "ipykernel>=6.29.5",
+    "jax==0.4.36",
+    "jupyter>=1.1.1",
+    "librosa==0.10.2.post1",
+    "matplotlib==3.10.0",
+    "ml-collections==1.0.0",
+    "numpy==1.26.4",
+    "optax==0.2.4",
+    "orbax==0.1.9",
+    "orbax-checkpoint==0.10.3",
+    "pooch>=1.6.0",
+    "protobuf==5.29.2",
+    "tensorflow==2.18.0",
+    "tensorflow-datasets==4.9.7",
+    "tensorflow-io==0.37.1",
+    "tensorflow-probability==0.25.0",
+    "tf-keras==2.18.0",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+cuda = [
+  "jax[cuda12]==0.4.36",
+]
+
+[project.scripts]
+generate-waveforms = "tqe.generate_waveforms:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "tqe.__init__.__version__"}
+
+[dependency-groups]
+dev = [
+  "gitlint",
+  "jupyter",
+  "pre-commit",
+  "pytest>=7.2.0",
+  "pytest-cov>=4.0.0",
+  "ruff",
+  "xprof>=2.20.6",
+]
+experiments = [
+  "wandb==0.19.1",
+  "ml-collections>=1.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.bandit]
+skips = ["B101"]
+
+[tool.ruff]
+indent-width = 2
+line-length = 80
+exclude = ["*_test.py", "docs/**", "experiments/**/notebooks/**"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+extend-select = [
+  "UP", "I", "PL", "S"
+]
+ignore = [
+    "S301",
+    "PLR0913",
+    "S101",
+    "PLR2004",
+    "S603",
+    "S607",
+    "PLW2901",
+    "E731",
+    "PLR1714",
+    "PLR0915",
+    "PLR0912"
+]
+
+[tool.ruff.lint.pydocstyle]
+convention= 'google'
