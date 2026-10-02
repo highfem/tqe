@@ -23,6 +23,7 @@ from jax import random as jr
 from ml_collections import ConfigDict
 
 from tqe.denoising_diffusion import EDMParameterization, denoising_diffusion
+from tqe.flow_matching import FlowMatchingConfig, flow_matching
 from tqe.nn import dit, vae
 from tqe.signal import processing_fns
 
@@ -128,7 +129,8 @@ def load_ddm(checkpoint_dir: Path) -> tuple:
 
   Returns:
     ``(model, full_cfg, ema_params)`` where ``full_cfg`` is a ``ConfigDict``
-    containing the full training configuration.
+    of the training config; it must contain ``model``, ``representation``,
+    and ``training.ema_rate``.
 
   Raises:
     FileNotFoundError: If ``full_config.pkl`` is absent.
@@ -137,9 +139,9 @@ def load_ddm(checkpoint_dir: Path) -> tuple:
   if not full_cfg_path.exists():
     raise FileNotFoundError(
       f"full_config.pkl not found in {checkpoint_dir}. "
-      "The latent_diffusion archive must include a full_config.pkl "
-      "with keys 'representation', 'training.ema_rate', and "
-      "'model.sampler.n_steps'."
+      "The latent_diffusion archive must include full_config.pkl: the "
+      "training config (get_config().to_dict() without 'callbacks') with "
+      "keys 'model', 'representation', and 'training.ema_rate'."
     )
   cfg = ConfigDict(_load_pickle(checkpoint_dir / "config.pkl"))
   full_cfg = ConfigDict(_load_pickle(full_cfg_path))
@@ -151,6 +153,47 @@ def load_ddm(checkpoint_dir: Path) -> tuple:
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
+
+
+def _flow_matching_sample_fn(apply_fn, n_steps, ema_rate):
+  config = FlowMatchingConfig(n_sampling_steps=n_steps)
+  return flow_matching(apply_fn, config, ema_rate).sample_fn
+
+
+def _edm_sample_fn(apply_fn, n_steps, ema_rate):
+  config = EDMParameterization(n_sampling_steps=n_steps)
+  return denoising_diffusion(apply_fn, config, ema_rate).sample_fn
+
+
+_SAMPLERS: dict[str, Callable[[Callable, int, float], Callable]] = {
+  "flow_matching": _flow_matching_sample_fn,
+  "edm": _edm_sample_fn,
+}
+
+
+def _make_sample_fn(
+  name: str, apply_fn: Callable, n_steps: int, ema_rate: float
+) -> Callable:
+  """Builds the sampler for the objective the DiT was trained with.
+
+  Args:
+    name: Objective name stored in the checkpoint config (``model.name``).
+    apply_fn: Flax ``apply`` of the score network.
+    n_steps: Number of sampling steps.
+    ema_rate: EMA decay rate; the objective factories require it, sampling
+      does not use it.
+
+  Returns:
+    ``sample_fn(rng_key, state, context, condition)``.
+
+  Raises:
+    ValueError: If ``name`` is not a known objective.
+  """
+  if name not in _SAMPLERS:
+    raise ValueError(
+      f"unknown objective '{name}'; available: {sorted(_SAMPLERS)}"
+    )
+  return _SAMPLERS[name](apply_fn, n_steps, ema_rate)
 
 
 class _InferenceState(NamedTuple):
@@ -223,10 +266,12 @@ def build_pipeline(weights_dir: Path) -> GenerationPipeline:
     max_len=repr_cfg.max_len,
   )
 
-  edm_cfg = EDMParameterization(n_sampling_steps=full_cfg.model.sampler.n_steps)
-  ddm_sample_fn = denoising_diffusion(
-    ddm_model.apply, edm_cfg, full_cfg.training.ema_rate
-  ).sample_fn
+  ddm_sample_fn = _make_sample_fn(
+    full_cfg.model.name,
+    ddm_model.apply,
+    full_cfg.model.sampler.n_steps,
+    full_cfg.training.ema_rate,
+  )
 
   def _sample(rng_key, state, batch):
     ctx_key, sample_key = jr.split(rng_key)
@@ -242,13 +287,26 @@ def build_pipeline(weights_dir: Path) -> GenerationPipeline:
     repr_fn=repr_fn,
     inv_repr_fn=inv_repr_fn,
     max_len=repr_cfg.max_len,
-    condition_keys=tuple(full_cfg.data.condition_keys),
+    condition_keys=_CONDITION_KEYS,
   )
 
 
 # ---------------------------------------------------------------------------
 # I/O helpers
 # ---------------------------------------------------------------------------
+
+# Order of the metadata values the DiT was conditioned on; matches the
+# ``meta`` vector of the Amatrice dataset builder used for training.
+_CONDITION_KEYS = (
+  "magnitude",
+  "vs30",
+  "station_longitude",
+  "station_latitude",
+  "station_elevation",
+  "hypocentre_depth",
+  "hypocentre_longitude",
+  "hypocentre_latitude",
+)
 
 
 def _read_input_batches(

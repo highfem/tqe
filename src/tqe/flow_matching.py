@@ -98,7 +98,7 @@ def flow_matching(
       times = i / config.n_sampling_steps
       times = times * (config.time_max - config.time_eps) + config.time_eps
       times = jnp.repeat(times, n)
-      vt = state.apply_fn(
+      vt = model_fn(
         variables={"params": state.ema_params},
         inputs=samples,
         context=context,
