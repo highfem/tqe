@@ -33,7 +33,7 @@ pip install "git+https://github.com/highfem/tqe@<RELEASE>#egg=tqe[cuda]"
 
 ### Generating waveforms
 
-Pretrained weights are downloaded automatically on first use (cached to `~/.cache/tqe/weights/`; override with `$TQE_CACHE_DIR`).
+Pretrained weights are downloaded automatically from [Zenodo](https://doi.org/10.5281/zenodo.23107915) on first use (cached to `~/.cache/tqe/weights/`; override with `$TQE_CACHE_DIR`).
 The command reads an HDF5 file of context waveforms and writes synthetic target waveforms to a new HDF5 file:
 
 ```bash

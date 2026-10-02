@@ -165,3 +165,4 @@ workdir/*
 .run*
 weights/
 release/
+.DS_Store
