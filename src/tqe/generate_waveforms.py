@@ -100,10 +100,19 @@ def _load_pickle(path: Path) -> dict:
     return pickle.load(f)  # noqa: S301
 
 
+def _restore_args(metadata):
+  if isinstance(metadata, orbax.checkpoint.metadata.StringMetadata):
+    return orbax.checkpoint.RestoreArgs()
+  return orbax.checkpoint.RestoreArgs(restore_type=np.ndarray)
+
+
 def _restore_best(checkpoint_dir: Path) -> dict:
-  return orbax.checkpoint.PyTreeCheckpointer().restore(
-    str(checkpoint_dir / "best")
-  )
+  # Checkpoints record the device they were saved on (cuda:0 for the
+  # pretrained weights); restoring as NumPy arrays loads them on any machine.
+  path = str(checkpoint_dir / "best")
+  checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+  restore_args = jax.tree.map(_restore_args, checkpointer.metadata(path))
+  return checkpointer.restore(path, restore_args=restore_args)
 
 
 def load_vae(checkpoint_dir: Path) -> tuple:

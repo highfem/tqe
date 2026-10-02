@@ -1,5 +1,6 @@
 """Tests for the generate-waveforms sampling pipeline."""
 
+import json
 import pickle
 
 import h5py
@@ -174,6 +175,29 @@ def test_generate_writes_samples_for_each_entry(weights_dir, tmp_path):
     assert np.all(np.isfinite(f["target_hat"][:]))
     expected_meta = np.tile(np.arange(8, dtype=np.float32), (6, 1))
     np.testing.assert_array_equal(f["meta"][:], expected_meta)
+
+
+def test_restore_best_loads_checkpoint_saved_on_gpu(tmp_path):
+  orbax.checkpoint.PyTreeCheckpointer().save(
+    str(tmp_path / "best"),
+    {
+      "state": {"params": {"w": jnp.ones((2, 3))}},
+      "config": {"name": "flow_matching"},
+    },
+  )
+  sharding_file = tmp_path / "best" / "_sharding"
+  gpu = json.dumps(
+    {"sharding_type": "SingleDeviceSharding", "device_str": "cuda:0"}
+  )
+  sharding = json.loads(sharding_file.read_text())
+  sharding_file.write_text(json.dumps({k: gpu for k in sharding}))
+
+  restored = gw._restore_best(tmp_path)
+
+  np.testing.assert_array_equal(
+    restored["state"]["params"]["w"], np.ones((2, 3))
+  )
+  assert restored["config"]["name"] == "flow_matching"
 
 
 def test_check_input_rejects_short_context(tmp_path):
