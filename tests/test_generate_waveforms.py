@@ -174,3 +174,20 @@ def test_generate_writes_samples_for_each_entry(weights_dir, tmp_path):
     assert np.all(np.isfinite(f["target_hat"][:]))
     expected_meta = np.tile(np.arange(8, dtype=np.float32), (6, 1))
     np.testing.assert_array_equal(f["meta"][:], expected_meta)
+
+
+def test_check_input_rejects_short_context(tmp_path):
+  _write_input(tmp_path / "in.h5", n=1, length=6000)
+  with pytest.raises(ValueError, match="6000 samples"):
+    gw._check_input(str(tmp_path / "in.h5"), gw._CONDITION_KEYS, _MAX_LEN)
+
+
+def test_check_input_names_missing_metadata(tmp_path):
+  _write_input(tmp_path / "in.h5", n=1, drop_key="vs30")
+  with pytest.raises(ValueError, match="vs30"):
+    gw._check_input(str(tmp_path / "in.h5"), gw._CONDITION_KEYS, _MAX_LEN)
+
+
+def test_check_input_accepts_channel_first(tmp_path):
+  _write_input(tmp_path / "in.h5", n=1, channel_first=True)
+  gw._check_input(str(tmp_path / "in.h5"), gw._CONDITION_KEYS, _MAX_LEN)

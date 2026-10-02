@@ -35,7 +35,8 @@ The first run downloads pretrained weights from Zenodo to
 
 Input HDF5 datasets:
   context             float32 (N, L, 3)  three-component context waveforms
-                      (N, 3, L) channel-first is accepted and transposed)
+                      sampled at 100 Hz, L >= 8161 samples
+                      ((N, 3, L) channel-first is accepted and transposed)
   magnitude, vs30, station_longitude, station_latitude,
   station_elevation, hypocentre_depth, hypocentre_longitude,
   hypocentre_latitude
@@ -309,6 +310,35 @@ _CONDITION_KEYS = (
 )
 
 
+def _check_input(path: str, condition_keys: tuple, min_len: int) -> None:
+  """Checks that an input HDF5 file can be sampled from.
+
+  Args:
+    path: Input HDF5 file path.
+    condition_keys: Metadata dataset names the file must contain.
+    min_len: Minimum context length in samples.
+
+  Raises:
+    ValueError: If datasets are missing, ``context`` is not
+      ``(N, L, 3)`` or ``(N, 3, L)``, or ``L < min_len``.
+  """
+  with h5py.File(path, "r") as f:
+    missing = [k for k in ("context", *condition_keys) if k not in f]
+    if missing:
+      raise ValueError(f"{path} is missing datasets: {missing}")
+    shape = f["context"].shape
+  if len(shape) != 3 or 3 not in (shape[1], shape[2]):
+    raise ValueError(
+      f"context must have shape (N, L, 3) or (N, 3, L), got {shape}"
+    )
+  length = shape[1] if shape[-1] == 3 else shape[-1]
+  if length < min_len:
+    raise ValueError(
+      f"context waveforms have {length} samples; the model needs at "
+      f"least {min_len}"
+    )
+
+
 def _read_input_batches(
   path: str, entry_batch_size: int, condition_keys: tuple
 ):
@@ -359,6 +389,7 @@ def generate(
     batch_size_per_device: Per-device batch size for pmap.
     seed: RNG seed for reproducibility.
   """
+  _check_input(input_path, pipeline.condition_keys, pipeline.max_len)
   rng = jr.PRNGKey(seed)
   n_dev = jax.device_count()
   entry_chunk = max(1, batch_size_per_device * n_dev // n_per_entry)
@@ -440,9 +471,9 @@ def generate(
 
 
 def main() -> None:
-  """Command-line entry point for ``tqe-generate``."""
+  """Command-line entry point for ``generate-waveforms``."""
   parser = argparse.ArgumentParser(
-    prog="tqe-generate",
+    prog="generate-waveforms",
     description=_DESCRIPTION,
     formatter_class=argparse.RawDescriptionHelpFormatter,
   )
