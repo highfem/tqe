@@ -52,11 +52,17 @@ Output HDF5 datasets:
 # Zenodo weight registry
 # ---------------------------------------------------------------------------
 
-_ZENODO_BASE = "https://zenodo.org/record/PLACEHOLDER/files"
+_ZENODO_BASE = "https://zenodo.org/records/23107915/files"
 _WEIGHTS: dict[str, str] = {
-  "context_encoder.tar.gz": "sha256:PLACEHOLDER",
-  "target_encoder.tar.gz": "sha256:PLACEHOLDER",
-  "latent_diffusion.tar.gz": "sha256:PLACEHOLDER",
+  "context_encoder.tar.gz": (
+    "sha256:f710323c80ff471d741df79cc108f0d5bba923af322eb98899ed38a1b167d083"
+  ),
+  "target_encoder.tar.gz": (
+    "sha256:3c75aaa99ae1e439d6ef3bda96cf95aae647e6c064338f64594703cff33b4974"
+  ),
+  "latent_diffusion.tar.gz": (
+    "sha256:44b857bccfbd59a4c3e04a6b468f685e809df1114d544cf63c7598b6f3a08b39"
+  ),
 }
 _CACHE_DIR = (
   Path(os.environ.get("TQE_CACHE_DIR", str(Path.home() / ".cache" / "tqe")))
@@ -80,7 +86,7 @@ def get_weights(cache_dir: Path | None = None) -> Path:
   dest.mkdir(parents=True, exist_ok=True)
   for name, checksum in _WEIGHTS.items():
     pooch.retrieve(
-      url=f"{_ZENODO_BASE}/{name}",
+      url=f"{_ZENODO_BASE}/{name}?download=1",
       known_hash=checksum,
       fname=name,
       path=str(dest),

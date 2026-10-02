@@ -2,6 +2,7 @@
 
 import json
 import pickle
+import re
 
 import h5py
 import numpy as np
@@ -198,6 +199,26 @@ def test_restore_best_loads_checkpoint_saved_on_gpu(tmp_path):
     restored["state"]["params"]["w"], np.ones((2, 3))
   )
   assert restored["config"]["name"] == "flow_matching"
+
+
+def test_get_weights_downloads_from_zenodo_record(monkeypatch, tmp_path):
+  calls = []
+  monkeypatch.setattr(gw.pooch, "retrieve", lambda **kw: calls.append(kw))
+
+  gw.get_weights(tmp_path)
+
+  names = (
+    "context_encoder.tar.gz",
+    "target_encoder.tar.gz",
+    "latent_diffusion.tar.gz",
+  )
+  assert [c["url"] for c in calls] == [
+    f"https://zenodo.org/records/23107915/files/{name}?download=1"
+    for name in names
+  ]
+  assert all(
+    re.fullmatch(r"sha256:[0-9a-f]{64}", c["known_hash"]) for c in calls
+  )
 
 
 def test_check_input_rejects_short_context(tmp_path):
