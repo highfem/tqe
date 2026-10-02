@@ -163,3 +163,5 @@ workdir/*
 
 
 .run*
+weights/
+release/
