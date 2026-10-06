@@ -1,13 +1,13 @@
 # This quake exists
 
-[![ci](https://github.com/highfem/tqe-model/actions/workflows/ci.yaml/badge.svg)](https://github.com/highfem/tqe-model/actions/workflows/ci.yaml)
-[![arXiv](https://img.shields.io/badge/arXiv-2410.19343-b31b1b.svg)](https://arxiv.org/abs/2410.19343)
+[![ci](https://github.com/highfem/tqe/actions/workflows/ci.yaml/badge.svg)](https://github.com/highfem/tqe/actions/workflows/ci.yaml)
+[![arXiv](https://img.shields.io/badge/arXiv-2610.04334-b31b1b.svg)](https://arxiv.org/abs/2610.04334)
 
 ## About
 
 `tqe` implements *HighFEM-2*, a Generative Waveform Model (GWM) for conditional
 synthesis of seismic waveforms built on JAX and Flax. For details see the
-[manuscript](https://arxiv.org/).
+[manuscript](https://arxiv.org/abs/2610.04334).
 
 The repository has two layers:
 
@@ -127,3 +127,19 @@ We welcome contributions in the form of pull requests. To get started:
    ```
 
 5. **Push your branch and open a pull request.**
+
+## Citation
+
+If you find our work relevant to your research, please consider citing:
+
+```bibtex
+@misc{palgunadi2026broadband,
+    title={Broadband Ground-Motion Synthesis by Conditioning Denoising Diffusion Models on Low-Frequency Waveforms},
+    author={Kadek Hendrawan Palgunadi and Simon Dirmeier and Maria Koroni and Laura Ermert and Men-Andrin Meier},
+    year={2026},
+    eprint={2610.04334},
+    archivePrefix={arXiv},
+    primaryClass={physics.geo-ph},
+    url={https://arxiv.org/abs/2610.04334}
+}
+```

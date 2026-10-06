@@ -2,7 +2,7 @@
 
 This directory contains the training and evaluation code for *HighFEM-2*,
 a Generative Waveform Model (GWM) trained on the Amatrice dataset.
-See the [manuscript](https://arxiv.org/) for details.
+See the [manuscript](https://arxiv.org/abs/2610.04334) for details.
 
 ## Setup
 
